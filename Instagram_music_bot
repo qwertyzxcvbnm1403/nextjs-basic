@@ -1,0 +1,211 @@
+import os
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler
+from pytube import YouTube
+from yt_dlp import YoutubeDL
+import requests
+import re
+
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Bot Token from @BotFather
+TOKEN = "8384438332:AAEr7ODEIw2FGVlksupl0GlO8AwGGdoxkL4"
+
+# Supported domains
+SUPPORTED_DOMAINS = [
+    'youtube.com', 'youtu.be', 
+    'instagram.com', 'tiktok.com',
+    'soundcloud.com', 'facebook.com'
+]
+
+def start(update: Update, context: CallbackContext) -> None:
+    """Send a message when the command /start is issued."""
+    user = update.effective_user
+    welcome_message = (
+        f"👋 Salom {user.first_name}!\n\n"
+        "🎵 instagam_music_bot ga xush kelibsiz!\n\n"
+        "📥 YouTube, Instagram, TikTok va boshqa platformalardan "
+        "video va audio yuklab olish uchun link yuboring.\n\n"
+        "ℹ️ Botdan foydalanish uchun sizga kerak bo'lgan media linkini shu yerga yuboring."
+    )
+    update.message.reply_text(welcome_message)
+
+def help_command(update: Update, context: CallbackContext) -> None:
+    """Send a message when the command /help is issued."""
+    help_text = (
+        "🆘 FullSaverBot Yordam\n\n"
+        "📌 Bot quyidagi platformalarni qo'llab-quvvatlaydi:\n"
+        "- YouTube (video/audio)\n"
+        "- Instagram (reels/posts)\n"
+        "- TikTok (video)\n"
+        "- SoundCloud (audio)\n\n"
+        "📎 Faqat media linkini botga yuboring va men sizga yuklab olish variantlarini taqdim etaman.\n\n"
+        "⚙️ Bot muammolari bo'lsa: @your_username"
+    )
+    update.message.reply_text(help_text)
+
+def is_supported_url(url: str) -> bool:
+    """Check if the URL is from a supported domain."""
+    return any(domain in url for domain in SUPPORTED_DOMAINS)
+
+def extract_info(url: str) -> dict:
+    """Extract video/audio info using yt-dlp."""
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': True
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(url, download=False)
+            return info
+        except Exception as e:
+            logger.error(f"Error extracting info: {e}")
+            return None
+
+def download_media(url: str, is_audio: bool = False) -> str:
+    """Download media and return the file path."""
+    ydl_opts = {
+        'format': 'bestaudio/best' if is_audio else 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'outtmpl': '%(title)s.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+    }
+    
+    with YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            return filename
+        except Exception as e:
+            logger.error(f"Download error: {e}")
+            return None
+
+def handle_message(update: Update, context: CallbackContext) -> None:
+    """Handle incoming messages with URLs."""
+    message = update.message
+    text = message.text
+    
+    # Check if message contains a URL
+    url_match = re.search(r'(https?://\S+)', text)
+    if not url_match:
+        message.reply_text("❌ Iltimos, media linkini yuboring!")
+        return
+    
+    url = url_match.group(1)
+    
+    if not is_supported_url(url):
+        message.reply_text("❌ Ushbu platforma hozircha qo'llab-quvvatlanmaydi!")
+        return
+    
+    # Get video info
+    info = extract_info(url)
+    if not info:
+        message.reply_text("❌ Xatolik yuz berdi. Linkni tekshirib, qayta urinib ko'ring.")
+        return
+    
+    # Create download options
+    keyboard = [
+        [
+            InlineKeyboardButton("🎥 Video", callback_data=f"video_{url}"),
+            InlineKeyboardButton("🎵 Audio", callback_data=f"audio_{url}"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Send options to user
+    message.reply_text(
+        f"📌 {info.get('title', 'Media')}\n\n"
+        "Quyidagi formatlardan birini tanlang:",
+        reply_markup=reply_markup
+    )
+
+def button_handler(update: Update, context: CallbackContext) -> None:
+    """Handle button callbacks."""
+    query = update.callback_query
+    query.answer()
+    
+    data = query.data
+    url = data.split('_', 1)[1]
+    is_audio = data.startswith('audio_')
+    
+    # Send "processing" message
+    processing_msg = query.edit_message_text(text="⏳ Yuklab olinmoqda... Iltimos kuting!")
+    
+    try:
+        # Download media
+        file_path = download_media(url, is_audio)
+        if not file_path:
+            processing_msg.edit_text("❌ Yuklab olishda xatolik yuz berdi!")
+            return
+        
+        # Send file to user
+        if is_audio:
+            with open(file_path, 'rb') as audio_file:
+                context.bot.send_audio(
+                    chat_id=query.message.chat_id,
+                    audio=audio_file,
+                    title=os.path.basename(file_path)
+                )
+        else:
+            with open(file_path, 'rb') as video_file:
+                context.bot.send_video(
+                    chat_id=query.message.chat_id,
+                    video=video_file,
+                    supports_streaming=True
+                )
+        
+        # Delete processing message
+        context.bot.delete_message(
+            chat_id=query.message.chat_id,
+            message_id=processing_msg.message_id
+        )
+        
+        # Clean up downloaded file
+        os.remove(file_path)
+        
+    except Exception as e:
+        logger.error(f"Error sending file: {e}")
+        processing_msg.edit_text("❌ Xatolik yuz berdi! Iltimos, keyinroq qayta urinib ko'ring.")
+
+def error_handler(update: Update, context: CallbackContext) -> None:
+    """Log errors."""
+    logger.error(f"Update {update} caused error {context.error}")
+    if update.message:
+        update.message.reply_text("❌ Botda xatolik yuz berdi. Iltimos, keyinroq qayta urinib ko'ring.")
+
+def main() -> None:
+    """Start the bot."""
+    # Create the Updater and pass it your bot's token.
+    updater = Updater(TOKEN)
+
+    # Get the dispatcher to register handlers
+    dispatcher = updater.dispatcher
+
+    # Register command handlers
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(CommandHandler("help", help_command))
+
+    # Register message handler
+    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+
+    # Register button handler
+    dispatcher.add_handler(CallbackQueryHandler(button_handler))
+
+    # Register error handler
+    dispatcher.add_error_handler(error_handler)
+
+    # Start the Bot
+    updater.start_polling()
+
+    # Run the bot until you press Ctrl-C
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
